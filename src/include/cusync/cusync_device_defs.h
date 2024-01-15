@@ -28,7 +28,7 @@ namespace cusync {
    * Wait until the semaphore of the tile reaches the wait value
    */
   CUSTAGE_METHOD_DEF(CuSyncError) wait(dim3& tile, uint32_t waitingThread, bool callSync) {
-    if (!isConsumer()) return CuSyncErrorNotConsumer;
+    // if (!isConsumer()) return CuSyncErrorNotConsumer;
     if (!inputPolicy_.isSync(tile, prodGrid_)) return CuSyncSuccess;
     
     if (threadIdx.x == waitingThread && threadIdx.y == 0 && threadIdx.z == 0) {
@@ -37,7 +37,7 @@ namespace cusync {
       auto v = globalLoad(&tileStatusRead_[idx]);
       while(v < iter * w) {
         v = globalVolatileLoad(&tileStatusRead_[idx]);
-      }
+      } // 到这里就说明，前面的producer的这一行就已经都算完了。那么
     }
 
     if (callSync)
@@ -50,7 +50,7 @@ namespace cusync {
    * Post the status of completion of tile.
   */
   CUSTAGE_METHOD_DEF(CuSyncError) post(const dim3& tile, uint32_t postThread) {
-    if (!isProducer()) return CuSyncErrorNotProducer;
+    // if (!isProducer()) return CuSyncErrorNotProducer; // 这个根本不需要。因为我们现在有多个矩阵乘法，最初始和最末尾直接在device函数里面用if排除掉就可以了。
     __syncthreads();
     if (threadIdx.x == postThread && threadIdx.y == 0 && threadIdx.z == 0) {
       __threadfence_system();

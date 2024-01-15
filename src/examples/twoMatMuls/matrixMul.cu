@@ -30,7 +30,7 @@
 // System includes
 #include <assert.h>
 #include <stdio.h>
-
+#include <cuda/annotated_ptr>
 // CUDA runtime
 #include <cuda_runtime.h>
 
@@ -46,16 +46,29 @@ using namespace cusync;
 
 //Define Producer and Consumer CuStage
 const int BLOCK_SIZE = 32;
-using Sync = TileSync<IdentityOrder, BLOCK_SIZE, BLOCK_SIZE>;
-using ProdCuStage = CuStage<IdentityOrder, NoSync, Sync>;
-using ConsCuStage = CuStage<IdentityOrder, Sync, NoSync>;
+// using Sync = TileSync<IdentityOrder, BLOCK_SIZE, BLOCK_SIZE>; 
+using Sync = RowSync<BLOCK_SIZE>;  // 要改成rowsync，这里要改成这样，下面要把Sync sync;改成 Sync sync(grid.x);
 
-template <typename CuStageTy>
-__global__ void MatrixMulCUDA(CuStageTy custage, float *C, float *A,
-                              float *B, int wA, int wB) {
+using ProdCuStage = CuStage<IdentityOrder, NoSync, Sync>;
+using ConsCuStage = CuStage<IdentityOrder, Sync, Sync>;
+using ThirdCuStage = CuStage<IdentityOrder, Sync, NoSync>;
+
+// template <typename CuStageTy>
+// __global__ void MatrixMulCUDA(CuStageTy custage, float *C, float *A,
+//                               float *B, int wA, int wB, int current_stage) {
+                                // current_stage是用于tile的，比如有三个矩阵乘法，那依此就是0,1,2
+template <typename CuStageTy, typename typeA, typename typeB, typename typeC>
+__global__ void MatrixMulCUDA(CuStageTy custage, typeA C, typeB A,
+                              typeC B, int wA, int wB, int current_stage) {
   __shared__ int tileSh[3];
   // Get tile to compute by this thread block
   dim3 tile = custage.tile((dim3*)&tileSh[0]);
+
+
+
+  if(threadIdx.x==0&&threadIdx.y==0&&threadIdx.z==0&&blockIdx.x==0&&blockIdx.y==0&&blockIdx.z==0){
+    printf("wA=%d, wB=%d\n", wA, wB);
+  }
 
   // Block index
   int bx = tile.x;
@@ -64,21 +77,21 @@ __global__ void MatrixMulCUDA(CuStageTy custage, float *C, float *A,
   // Thread index
   int tx = threadIdx.x;
   int ty = threadIdx.y;
-
+// 假设bx=by=0;已知wA=wB=256
   // Index of the first sub-matrix of A processed by the block
-  int aBegin = wA * BLOCK_SIZE * by;
+  int aBegin = wA * BLOCK_SIZE * by;// aBegin=256*32*0=0
 
   // Index of the last sub-matrix of A processed by the block
-  int aEnd = aBegin + wA - 1;
+  int aEnd = aBegin + wA - 1;// aEnd=0+256-1=255
 
   // Step size used to iterate through the sub-matrices of A
-  int aStep = BLOCK_SIZE;
+  int aStep = BLOCK_SIZE; // aStep=32  a是向右走的
 
   // Index of the first sub-matrix of B processed by the block
-  int bBegin = BLOCK_SIZE * bx;
+  int bBegin = BLOCK_SIZE * bx; // bBegin=32*0=0
 
   // Step size used to iterate through the sub-matrices of B
-  int bStep = BLOCK_SIZE * wB;
+  int bStep = BLOCK_SIZE * wB; // bStep=32*256=8192  B是向下在走的
 
   // Csub is used to store the element of the block sub-matrix
   // that is computed by the thread
@@ -100,8 +113,24 @@ __global__ void MatrixMulCUDA(CuStageTy custage, float *C, float *A,
     // one element of each matrix
     // Wait for tile of A to be computed by producer kernel
     
-    dim3 tile = {(uint32_t)(a - aBegin), (uint32_t)by * BLOCK_SIZE, 1};
-    custage.wait(tile);
+    // if(threadIdx.x==0&&threadIdx.y==0&&threadIdx.z==0&&blockIdx.x==0&&blockIdx.y==0&&blockIdx.z==0){
+    //   printf("tile.x=%d, tile.y=%d\n", (uint32_t)(a - aBegin), (uint32_t)by * BLOCK_SIZE);
+    // }
+
+    if(current_stage!=0){
+      dim3 tile = {(uint32_t)(a - aBegin), (uint32_t)by * BLOCK_SIZE, current_stage-1}; // 这里by这样写是因为by是考虑纵向向下，直接拿bBegin写就得除，不如直接写成by*BLOCK_SIZE。输出类似如下：
+  // tile.x=0, tile.y=160
+  // tile.x=32, tile.y=160
+  // tile.x=64, tile.y=160
+  // tile.x=96, tile.y=160
+  // tile.x=128, tile.y=160
+  // tile.x=160, tile.y=160
+  // tile.x=192, tile.y=160
+  // tile.x=224, tile.y=160
+  // 这里tile.z设置为1是，post原生的是0，然后wait就设为1，做个区分。
+      custage.wait(tile);
+    }
+
 
     As[ty][tx] = A[a + wA * ty + tx];
     Bs[ty][tx] = B[b + wB * ty + tx];
@@ -128,8 +157,16 @@ __global__ void MatrixMulCUDA(CuStageTy custage, float *C, float *A,
   int c = wB * BLOCK_SIZE * by + BLOCK_SIZE * bx;
   C[c + wB * ty + tx] = Csub;
 
-  // Post the status of tile when computed
-  custage.post({(uint32_t)bx * BLOCK_SIZE, (uint32_t)by * BLOCK_SIZE, 0});
+
+  if(current_stage!=2){
+    // Post the status of tile when computed
+    custage.post({(uint32_t)bx * BLOCK_SIZE, (uint32_t)by * BLOCK_SIZE, current_stage});
+  }
+
+
+  if(threadIdx.x==0&&threadIdx.y==0&&threadIdx.z==0&&blockIdx.x==0&&blockIdx.y==0&&blockIdx.z==0){
+    printf("bx=%d, by=%d\n", bx, by);
+  }
 }
 
 void ConstantInit(float *data, int size, float val) {
@@ -145,6 +182,14 @@ int MatrixMultiply(int argc, char **argv, int block_size, const dim3 &dimsA,
                    const dim3 &dimsB, const dim3 &dimsD) {
   // Allocate host memory for matrices A and B
   unsigned int size_A = dimsA.x * dimsA.y;
+
+
+  printf("Matrix A size: (%d, %d)\n", dimsA.x, dimsA.y);
+  printf("Matrix B size: (%d, %d)\n", dimsB.x, dimsB.y);
+  printf("Matrix D size: (%d, %d)\n", dimsD.x, dimsD.y);
+
+
+
   unsigned int mem_size_A = sizeof(float) * size_A;
   float *h_A;
   CUDA_CHECK(cudaMallocHost(&h_A, mem_size_A));
@@ -154,17 +199,20 @@ int MatrixMultiply(int argc, char **argv, int block_size, const dim3 &dimsA,
   CUDA_CHECK(cudaMallocHost(&h_B, mem_size_B));
   float *h_D;
   CUDA_CHECK(cudaMallocHost(&h_D, mem_size_A));
-  
-  cudaStream_t prod_stream, cons_stream;
+  float *h_F;
+  CUDA_CHECK(cudaMallocHost(&h_F, mem_size_A));
+
+  cudaStream_t prod_stream, cons_stream, third_stream;
 
   // Initialize host memory
   const float valB = 0.01f;
   ConstantInit(h_A, size_A, 1.0f);
   ConstantInit(h_B, size_B, valB);
   ConstantInit(h_D, size_B, valB);
+  ConstantInit(h_F, size_B, valB);
 
   // Allocate device memory
-  float *d_A, *d_B, *d_C, *d_D, *d_E;
+  float *d_A, *d_B, *d_C, *d_D, *d_E, *d_F, *d_G;
 
   // Allocate host matrix C and E
   dim3 dimsC(dimsB.x, dimsA.y, 1);
@@ -177,6 +225,11 @@ int MatrixMultiply(int argc, char **argv, int block_size, const dim3 &dimsA,
   float *h_E;
   CUDA_CHECK(cudaMallocHost(&h_E, mem_size_E));
 
+  dim3 dimsG(dimsB.x, dimsA.y, 1);
+  unsigned int mem_size_G = dimsC.x * dimsC.y * sizeof(float);
+  float *h_G;
+  CUDA_CHECK(cudaMallocHost(&h_G, mem_size_G));
+
   if (h_C == NULL) {
     fprintf(stderr, "Failed to allocate host matrix C!\n");
     exit(EXIT_FAILURE);
@@ -187,6 +240,8 @@ int MatrixMultiply(int argc, char **argv, int block_size, const dim3 &dimsA,
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_C), mem_size_C));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_D), mem_size_B));
   CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_E), mem_size_E));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_F), mem_size_B));
+  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_G), mem_size_G));
 
   // Allocate CUDA events that we'll use for timing
   cudaEvent_t start, stop;
@@ -194,6 +249,7 @@ int MatrixMultiply(int argc, char **argv, int block_size, const dim3 &dimsA,
   CUDA_CHECK(cudaEventCreate(&stop));
 
   CUDA_CHECK(cudaStreamCreateWithFlags(&cons_stream, cudaStreamNonBlocking));
+  CUDA_CHECK(cudaStreamCreateWithFlags(&third_stream, cudaStreamNonBlocking));
   CUDA_CHECK(cudaStreamCreateWithFlags(&prod_stream, cudaStreamNonBlocking));
 
   // copy host memory to device
@@ -203,46 +259,69 @@ int MatrixMultiply(int argc, char **argv, int block_size, const dim3 &dimsA,
       cudaMemcpy(d_B, h_B, mem_size_B, cudaMemcpyHostToDevice));
   CUDA_CHECK(
       cudaMemcpy(d_D, h_D, mem_size_B, cudaMemcpyHostToDevice));
-  
+  CUDA_CHECK(
+      cudaMemcpy(d_F, h_F, mem_size_B, cudaMemcpyHostToDevice));
+
   // Setup execution parameters
   dim3 threads(block_size, block_size, 1);
   dim3 grid(dimsB.x / threads.x, dimsA.y / threads.y, 1);
   
+  printf("grid.x=%d, grid.y=%d\n", grid.x, grid.y);
+
   // Create CuSync and CuStage
-  Sync sync;
+  // Sync sync;
+  Sync sync(grid.x);
   dim3 tilesize = threads;
   ProdCuStage prod(grid, tilesize, NoSync(), sync);
-  ConsCuStage cons(grid, tilesize, sync, NoSync());
+  ConsCuStage cons(grid, tilesize, sync, sync);
+  ThirdCuStage third(grid, tilesize, sync, NoSync());
+  
   CuSync::setProducerConsumerPair(prod, cons);
+  CuSync::setProducerConsumerPair(cons, third);
 
   // Create and start timer
   printf("Computing result using CUDA Kernel...\n");
 
+
+  cuda::annotated_ptr<float, cuda::access_property::persisting> d_C_1{d_C};
   assert (block_size == 32);
   // Invoke producer kernel (C = A * B)
   MatrixMulCUDA<ProdCuStage>
-        <<<grid, threads, 0, prod_stream>>>(prod, d_C, d_A, d_B, dimsA.x, dimsB.x);
+        <<<grid, threads, 0, prod_stream>>>(prod, d_C_1, d_A, d_B, dimsA.x, dimsB.x, 0);
 
   //Invoke wait kernel
   prod.invokeWaitKernel(cons_stream);
   
+  cuda::annotated_ptr<float, cuda::access_property::persisting> d_E_1{d_E};
   //Invoke consumer kernel (E = C * D)
   MatrixMulCUDA<ConsCuStage>
-        <<<grid, threads, 0, cons_stream>>>(cons, d_E, d_C, d_D, dimsA.x, dimsB.x);
+        <<<grid, threads, 0, cons_stream>>>(cons, d_E_1, d_C_1, d_D, dimsA.x, dimsB.x, 1);
   
+  //Invoke wait kernel
+  cons.invokeWaitKernel(third_stream);
+
+  cuda::annotated_ptr<float, cuda::access_property::normal> d_C_2{d_C};
+  // cuda::annotated_ptr<float, cuda::access_property::persisting> d_G_1{d_G};
+
+  //Invoke third kernel (G = E * F)
+  MatrixMulCUDA<ThirdCuStage><<<grid, threads, 0, third_stream>>>(third, d_G, d_E_1, d_F, dimsA.x, dimsB.x, 2);
+
   CUDA_CHECK(cudaDeviceSynchronize());
 
   //for next run increment the iteration counter
   prod.incrementIter();
-  cons.incrementIter();
+  cons.incrementIter();  // 有点不太理解这个的作用
 
   printf("Execution done\n");
   
   // Copy result from device to host
   CUDA_CHECK(
-      cudaMemcpy(h_C, d_C, mem_size_C, cudaMemcpyDeviceToHost));
+      cudaMemcpy(h_C, d_C_1.get(), mem_size_C, cudaMemcpyDeviceToHost));
   CUDA_CHECK(
-      cudaMemcpy(h_E, d_E, mem_size_C, cudaMemcpyDeviceToHost));
+      cudaMemcpy(h_E, d_E_1.get(), mem_size_C, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(
+      cudaMemcpy(h_G, d_G, mem_size_C, cudaMemcpyDeviceToHost));
+
 
   printf("Checking computed result for correctness: \n");
   bool correct = true;
@@ -275,13 +354,34 @@ int MatrixMultiply(int argc, char **argv, int block_size, const dim3 &dimsA,
 
     if (rel_err > eps) {
       printf("Error! Matrix[%05d]=%.8f, ref=%.8f error term is > %E\n", i,
-             h_E[i], dimsA.x * valB  * dimsA.x, eps);
+             h_E[i], dimsA.x * valB * dimsA.x * valB, eps);  // 原始代码这里不对，漏掉一个valB，不过不影响。。
       correct = false;
       break;
     }
   }
 
   printf("E results: %s\n", correct ? "PASS" : "FAIL");
+
+
+  double expected_G_value = dimsA.x * valB * dimsA.x * valB * dimsA.x * valB;
+  bool correct_G = true;  // 用于记录矩阵G是否正确的标志
+
+  for (int i = 0; i < static_cast<int>(dimsC.x * dimsC.y); i++) {
+    double abs_err_G = fabs(h_G[i] - expected_G_value);
+    double dot_length_G = dimsA.x;  // 这里假设了点积的长度，需要根据实际情况来设置
+    double abs_val_G = fabs(h_G[i]);
+    double rel_err_G = abs_err_G / abs_val_G / dot_length_G;
+
+    if (rel_err_G > eps) {
+      printf("Error! Matrix G[%05d]=%.8f, ref=%.8f error term is > %E\n", i,
+            h_G[i], expected_G_value, eps);
+      correct_G = false;
+      break;
+    }
+  }
+
+  printf("G results: %s\n", correct_G ? "PASS" : "FAIL");
+
 
   // Clean up memory
   CUDA_CHECK(cudaFreeHost(h_A));

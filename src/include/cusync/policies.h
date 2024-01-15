@@ -78,7 +78,8 @@ struct RowSync {
    */
   CUSYNC_DEVICE
   bool isSync(const dim3& tile, const dim3& grid) {
-    return tile.z == 1;
+    return true;
+    // return tile.z == 1;
   }
 
   /*

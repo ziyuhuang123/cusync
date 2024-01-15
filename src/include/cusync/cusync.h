@@ -5,7 +5,7 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <cuda_device_runtime_api.h>
-
+#include <cuda/annotated_ptr>
 #include "cusync_defines.h"
 
 #pragma once
@@ -110,6 +110,7 @@ private:
   //GPU pointer to wait kernel semaphore
   int* kernelExecuted_;
   
+  // volatile uint32_t* tileStatusWrite_0;
   volatile uint32_t* tileStatusWrite_;
   volatile uint32_t* tileStatusRead_;
 
@@ -186,6 +187,9 @@ public:
       CUDA_CHECK(cudaMalloc(&tileStatusWrite_, numTiles() * sizeof(int)));
       CUDA_CHECK(cudaMemset((uint32_t*)tileStatusWrite_, 0, numTiles() * sizeof(int)));
 
+      // cuda::annotated_ptr<volatile uint32_t, cuda::access_property::persisting> tileStatusWrite_(tileStatusWrite_0);
+
+
       //Allocate wait kernel semaphore
       if (!getAvoidWaitKernel()) {
         CUDA_CHECK(cudaMalloc(&kernelExecuted_, sizeof(int)));
@@ -226,7 +230,7 @@ public:
 
   //A producer does have a policy for its output 
   CUSYNC_DEVICE_HOST
-  bool isProducer() {return !std::is_same<OutputSyncPolicy, NoSync>::value;}
+  bool isProducer() {return !std::is_same<OutputSyncPolicy, NoSync>::value;}  // 或者不如叫，Producer_sync_policy_existance
 
   //A consumer does have a policy for its input 
   CUSYNC_DEVICE_HOST
